@@ -1,6 +1,6 @@
 # ffxiv-unstrip-acls
 
-Restores `PROCESS_VM_WRITE` (and `PROCESS_VM_READ`) to your user when launching FFXIV through the official launcher. Other launchers are unaffected.
+Restores `PROCESS_VM_WRITE` (and `PROCESS_VM_READ` just in case they get any funny ideas) to your user when launching FFXIV through the official launcher. Other launchers are unaffected.
 
 Fixes Discord overlay and other things which broke when SE decided to do this garbage.
 
