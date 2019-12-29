@@ -6,7 +6,7 @@ Fixes Discord overlay and other things which broke when SE decided to do this ga
 
 ## Install
 
-1. Download DLL from releases page
+1. Download DLL from [releases page](https://github.com/NotAdam/ffxiv-unstrip-acls/releases)
 2. Navigate to your game directory, where `game` and `boot` folders are located
 3. Open the `boot` folder
 4. Paste the `winmm.dll` into that directory
