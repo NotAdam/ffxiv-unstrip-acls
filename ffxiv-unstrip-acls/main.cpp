@@ -3,8 +3,11 @@
 #include <AccCtrl.h>
 
 #include <string>
+#include <thread>
 
 #include "minhook/MinHook.h"
+
+using namespace std::chrono_literals;
 
 // exports garbage
 // garbage copied from windows headers so we don't get export conflicts
@@ -117,6 +120,8 @@ extern "C" __declspec(dllexport) MMRESULT waveOutGetDevCapsW(
 typedef void (WINAPI* _OrigBuildExplicitAccessWithNameA)(PEXPLICIT_ACCESS_A, LPSTR, DWORD, ACCESS_MODE, DWORD);
 _OrigBuildExplicitAccessWithNameA oBuildExplicitAccessWithNameA = nullptr;
 
+DWORD lastRequestedPerms = 0;
+
 void hkBuildExplicitAccessWithNameA(
     PEXPLICIT_ACCESS_A pExplicitAccess,
     LPSTR              pTrusteeName,
@@ -125,6 +130,8 @@ void hkBuildExplicitAccessWithNameA(
     DWORD              Inheritance
 )
 {
+    lastRequestedPerms = AccessPermissions;
+
     // reset process read/write bits
     auto newPerms = AccessPermissions | PROCESS_VM_OPERATION | PROCESS_VM_READ | PROCESS_VM_WRITE;
 
@@ -132,6 +139,107 @@ void hkBuildExplicitAccessWithNameA(
     printf("new perms: %x\n", newPerms);
 
     oBuildExplicitAccessWithNameA(pExplicitAccess, pTrusteeName, newPerms, AccessMode, Inheritance);
+}
+
+typedef HANDLE (WINAPI* _OrigOpenProcess)(DWORD, BOOL, DWORD);
+_OrigOpenProcess oOpenProcess = nullptr;
+
+HANDLE hkOpenProcess(
+    DWORD dwDesiredAccess,
+    BOOL  bInheritHandle,
+    DWORD dwProcessId
+)
+{
+    auto processHandle = oOpenProcess(PROCESS_QUERY_INFORMATION, false, dwProcessId);
+    DWORD value = MAX_PATH;
+    char buffer[MAX_PATH];
+    if (processHandle)
+    {
+        QueryFullProcessImageName(processHandle, 0, buffer, &value);
+    }
+
+    printf("openprocess: perms: %ul process: %s (%ul)\n", dwDesiredAccess, buffer, dwProcessId);
+
+    // only run this code for ffxiv_dx11.exe and ffxiv.exe because they use PROCESS_ALL_ACCESS on their own executables
+    char drive[MAX_PATH];
+    char dir[MAX_PATH];
+    char fname[MAX_PATH];
+    char ext[MAX_PATH];
+
+    _splitpath_s(buffer, drive, dir, fname, ext);
+
+    if (strcmp(fname, "ffxiv_dx11") || strcmp(fname, "ffxiv"))
+    {
+        printf("ignoring non-game process: %s\n", fname);
+        return oOpenProcess(dwDesiredAccess, bInheritHandle, dwProcessId);
+    }
+
+    // we only care about the process flags
+    auto masked = dwDesiredAccess & 0x2FFF;
+    auto processMask = masked & ~lastRequestedPerms;
+
+    printf("perms: %ul\n", processMask);
+
+    if (processMask > 0)
+    {
+        printf("denied openprocess call\n");
+        SetLastError(ERROR_ACCESS_DENIED);
+        return NULL;
+    }
+
+    return oOpenProcess(dwDesiredAccess, bInheritHandle, dwProcessId);
+}
+
+typedef FARPROC(WINAPI* _OrigGetProcAddress)(HMODULE, LPCSTR);
+_OrigGetProcAddress oGetProcAddress = nullptr;
+
+HANDLE hkGetProcAddress(
+    _In_ HMODULE hModule,
+    _In_ LPCSTR lpProcName
+)
+{
+    printf("module: %p, fn: %s\n", hModule, lpProcName);
+
+    return oGetProcAddress(hModule, lpProcName);
+}
+
+bool HookFunc(const char* fnName, void* addr, void* hkFunc, void* orig)
+{
+    MH_STATUS status = MH_CreateHook(
+        addr,
+        hkFunc,
+        reinterpret_cast<LPVOID*>(orig)
+    );
+
+    if (status != MH_OK)
+    {
+        printf("failed to create %s hook! err: %d\n", fnName, status);
+        return false;
+    }
+
+    status = MH_EnableHook(addr);
+    if (status != MH_OK)
+    {
+        printf("failed to enable %s hook! err: %d\n", fnName, status);
+        return false;
+    }
+
+    return true;
+}
+
+bool HookFunc(const char* libName, const char* fnName, void* hkFunc, void* orig)
+{
+    auto lib = LoadLibrary(libName);
+    if (!lib)
+    {
+        return false;
+    }
+
+    auto addr = GetProcAddress(lib, fnName);
+
+    printf("fn: %p\n", addr);
+
+    return HookFunc(fnName, addr, hkFunc, orig);
 }
 
 BOOL APIENTRY DllMain(HMODULE hModule,
@@ -170,9 +278,6 @@ BOOL APIENTRY DllMain(HMODULE hModule,
             *(void**)&origWaveInGetNumDevs = (void*)GetProcAddress(lib, "waveInGetNumDevs");
             *(void**)&origWaveOutGetNumDevs = (void*)GetProcAddress(lib, "waveOutGetNumDevs");
             *(void**)&origWaveOutGetDevCapsW = (void*)GetProcAddress(lib, "waveOutGetDevCapsW");
-        
-
-            // blah
 
             MH_STATUS status;
 
@@ -183,37 +288,11 @@ BOOL APIENTRY DllMain(HMODULE hModule,
                 return FALSE;
             }
 
-            auto advapi = LoadLibrary("advapi32.dll");
-            if (advapi)
-            {
-                auto buildExplicitAccess = GetProcAddress(advapi, "BuildExplicitAccessWithNameA");
+            HookFunc("advapi32.dll", "BuildExplicitAccessWithNameA", &hkBuildExplicitAccessWithNameA, &oBuildExplicitAccessWithNameA);
 
-                printf("fn: %p\n", buildExplicitAccess);
+            HookFunc("OpenProcess", &OpenProcess, &hkOpenProcess, &oOpenProcess);
+            HookFunc("GetProcAddress", &GetProcAddress, &hkGetProcAddress, &oGetProcAddress);
 
-                status = MH_CreateHook(
-                    buildExplicitAccess,
-                    &hkBuildExplicitAccessWithNameA,
-                    reinterpret_cast<LPVOID*>(&oBuildExplicitAccessWithNameA)
-                );
-
-                if (status != MH_OK)
-                {
-                    printf("failed to create BuildExplicitAccessWithNameA hook! err: %d\n", status);
-                    return FALSE;
-                }
-
-                status = MH_EnableHook(buildExplicitAccess);
-                if (status != MH_OK)
-                {
-                    printf("failed to enable BuildExplicitAccessWithNameA hook! err: %d\n", status);
-                    return FALSE;
-                }
-            }
-            else
-            {
-                printf("wtf?\n");
-                return FALSE;
-            }
 
             break;
         }
